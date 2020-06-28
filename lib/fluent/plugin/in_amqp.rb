@@ -102,7 +102,7 @@ module Fluent::Plugin
         @ack_thread = Thread.new {
           @stop = false
           loop do 
-            [tag, success] = @ack_queue.pop
+            tag, success = @ack_queue.pop
             case tag
             when :stop
               @stop = true
@@ -131,9 +131,9 @@ module Fluent::Plugin
           cb = Proc.new do | success |
             @ack_queue.push([delivery.delivery_tag, success])
           end
-          payload = { :payload => payload, :callback => cb }
+          payload = { :payload => body, :callback => cb }
         else
-          payload = body
+          payload = { :payload => body }
         end
         router.emit(parse_tag(delivery, meta), parse_time(meta), payload)
         if @manual_ack && !@callback
