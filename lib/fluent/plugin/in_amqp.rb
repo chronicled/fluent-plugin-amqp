@@ -31,7 +31,9 @@ module Fluent::Plugin
     config_param :durable, :bool, default: false
     config_param :exclusive, :bool, default: false
     config_param :auto_delete, :bool, default: false
+    config_param :manual_ack, :bool, default: false
     config_param :passive, :bool, default: false
+    config_param :prefetch, :integer, default: 0
     config_param :payload_format, :string, default: "json"
     config_param :tag_key, :bool, default: false
     config_param :tag_header, :string, default: nil
@@ -45,6 +47,14 @@ module Fluent::Plugin
     config_param :exchange, :string, default: ""
     config_param :routing_key, :string, default: "#"                       # The routing key used to bind queue to exchange - # = matches all, * matches section (tag.*.info)
     config_param :auth_mechanism, :string, default: nil
+    # milliseconds to delay between messages
+    config_param :delay, :integer, default: 0
+
+    def initialize
+      super
+      @ack_queue = Queue.new
+      @ack_thread = nil
+    end
 
     def configure(conf)
       conf['format'] ||= conf['payload_format'] # legacy
@@ -70,6 +80,10 @@ module Fluent::Plugin
       @connection.start
       @channel = @connection.create_channel
 
+      if @prefetch > 0
+        @channel.prefetch(@prefetch)
+      end
+
       if @exclusive && fluentd_worker_id > 0
         log.info 'Config requested exclusive queue with multiple workers'
         @queue += ".#{fluentd_worker_id}"
@@ -83,16 +97,48 @@ module Fluent::Plugin
         q.bind(exchange=@exchange, routing_key: @routing_key)
       end
 
-      q.subscribe do |delivery, meta, msg|
+      if @manual_ack
+        @ack_thread = Thread.new {
+          @stop = false
+          loop do 
+            tag = @ack_queue.pop
+            case tag
+            when :stop
+              @stop = true
+            else
+              begin
+                @channel.acknowledge(tag, false)
+              rescue => e
+                log.error "Failed to acknowledge event", tag: tag, error: e
+              end
+            end
+            if @stop && @ack_queue.empty?
+              break
+            end
+          end
+        }
+      end
+
+      q.subscribe(:manual_ack => @manual_ack) do |delivery, meta, msg|
         log.debug "Recieved message #{@msg}"
         payload = parse_payload(msg)
         router.emit(parse_tag(delivery, meta), parse_time(meta), payload)
+        if @manual_ack
+          @ack_queue.push(delivery.delivery_tag)
+        end
+        if @delay > 0
+          sleep(delay / 1000)
+        end
       end
     end # AMQPInput#run
 
     def shutdown
       log.info "Closing connection"
       @connection.stop
+      if @manual_ack
+        @ack_queue.push(:stop)
+        @ack_thread && @ack_thread.join
+      end
       super
     end
 
